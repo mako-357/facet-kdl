@@ -3,12 +3,15 @@
 
 // cf. facet-toml/facet-json for examples
 
+mod serialize;
+pub use serialize::{KdlSerializeError, KdlSerializer, to_string};
+
 use std::{
     error::Error,
     fmt::{self, Display},
 };
 
-use facet_core::{Def, Facet, FieldFlags, Type, UserType};
+use facet_core::{Def, Facet, Type, UserType};
 use facet_reflect::{Partial, ReflectError};
 use kdl::{KdlDocument, KdlError as KdlParseError};
 
@@ -97,18 +100,71 @@ impl<'input, 'facet> KdlDeserializer<'input> {
         value: &kdl::KdlValue,
     ) -> Result<()> {
         log::trace!("Deserializing value: {:?}", value);
+        log::trace!("Current shape: {:?}", wip.shape());
 
-        // Handle scalar types
-        if let facet_core::Def::Scalar = wip.shape().def {
-            // For scalar types, we need to handle them directly
-            // The actual scalar type information is in the shape
-            self.deserialize_scalar_value(wip, value)?;
-        } else {
-            // For non-scalar types, we might need to handle them differently
-            log::warn!("Non-scalar type encountered: {:?}", wip.shape().def);
-            return Err(KdlError::from(KdlErrorKind::InvalidDocumentShape(
-                &wip.shape().def,
-            )));
+        // Check if it's a scalar or undefined type
+        match &wip.shape().def {
+            facet_core::Def::Scalar => {
+                // For scalar types, we need to handle them directly
+                self.deserialize_scalar_value(wip, value)?;
+            }
+            facet_core::Def::Undefined => {
+                // Undefined types like String need special handling
+                if let kdl::KdlValue::String(s) = value {
+                    log::trace!("Handling undefined type with value: {}", s);
+
+                    // Check if this is a String type and try multiple approaches
+                    if wip.shape().type_identifier == "String" {
+                        // Try set_from_function to directly write to memory
+                        log::trace!("Trying set_from_function for String");
+                        let string_value = s.clone();
+                        if wip
+                            .set_from_function(move |ptr| {
+                                unsafe {
+                                    let string_ptr = ptr.as_mut_byte_ptr() as *mut String;
+                                    core::ptr::write(string_ptr, string_value);
+                                }
+                                Ok(())
+                            })
+                            .is_ok()
+                        {
+                            log::trace!("set_from_function succeeded");
+                            return Ok(());
+                        }
+                    }
+
+                    // Try different approaches for other undefined types
+                    // 1. Try direct set
+                    if wip.set(s.clone()).is_ok() {
+                        log::trace!("Direct set succeeded");
+                        return Ok(());
+                    }
+
+                    // 2. Last resort: parse_from_str
+                    log::trace!("Falling back to parse_from_str");
+                    if wip.parse_from_str(s).is_ok() {
+                        log::trace!("parse_from_str succeeded");
+                        return Ok(());
+                    }
+
+                    log::error!("Failed to set undefined type value: {}", s);
+                    return Err(KdlError::from(KdlErrorKind::InvalidDocumentShape(
+                        &wip.shape().def,
+                    )));
+                } else {
+                    log::warn!("Non-string value for undefined type: {:?}", value);
+                    return Err(KdlError::from(KdlErrorKind::InvalidDocumentShape(
+                        &wip.shape().def,
+                    )));
+                }
+            }
+            _ => {
+                // For non-scalar types, we might need to handle them differently
+                log::warn!("Non-scalar type encountered: {:?}", wip.shape().def);
+                return Err(KdlError::from(KdlErrorKind::InvalidDocumentShape(
+                    &wip.shape().def,
+                )));
+            }
         }
 
         Ok(())
@@ -121,31 +177,124 @@ impl<'input, 'facet> KdlDeserializer<'input> {
     ) -> Result<()> {
         log::trace!("Deserializing scalar value: {:?}", value);
 
-        // For scalars, we need to check the actual type and deserialize accordingly
-        // This is a simplified version - in reality we'd need to inspect wip.shape() to get the exact scalar type
-        match value {
-            kdl::KdlValue::String(s) => {
-                // Set string value
-                let value = s.clone();
-                wip.set(value)?;
+        use facet_reflect::ScalarType;
+        use std::borrow::Cow;
+
+        // Get the scalar type from the shape
+        let scalar_type = ScalarType::try_from_shape(wip.shape()).ok_or_else(|| {
+            KdlError::from(KdlErrorKind::Reflect(
+                facet_reflect::ReflectError::OperationFailed {
+                    operation: "Not a scalar type",
+                    shape: wip.shape(),
+                },
+            ))
+        })?;
+
+        match (scalar_type, value) {
+            // String types
+            (ScalarType::String, kdl::KdlValue::String(s)) => {
+                wip.set(s.clone())?;
             }
-            kdl::KdlValue::Bool(b) => {
-                // Set boolean value
+            (ScalarType::CowStr, kdl::KdlValue::String(s)) => {
+                wip.set(Cow::Owned::<str>(s.clone()))?;
+            }
+
+            // Boolean
+            (ScalarType::Bool, kdl::KdlValue::Bool(b)) => {
                 wip.set(*b)?;
             }
-            kdl::KdlValue::Integer(n) => {
-                // For integers, we try to set based on the size
-                // This is simplified - we'd need to check the actual type
-                let value = *n as i64;
-                wip.set(value)?;
+
+            // Integer types
+            (ScalarType::I8, kdl::KdlValue::Integer(n))
+                if *n >= i8::MIN as i128 && *n <= i8::MAX as i128 =>
+            {
+                wip.set(*n as i8)?;
             }
-            kdl::KdlValue::Float(f) => {
-                // Set float value
+            (ScalarType::I16, kdl::KdlValue::Integer(n))
+                if *n >= i16::MIN as i128 && *n <= i16::MAX as i128 =>
+            {
+                wip.set(*n as i16)?;
+            }
+            (ScalarType::I32, kdl::KdlValue::Integer(n))
+                if *n >= i32::MIN as i128 && *n <= i32::MAX as i128 =>
+            {
+                wip.set(*n as i32)?;
+            }
+            (ScalarType::I64, kdl::KdlValue::Integer(n))
+                if *n >= i64::MIN as i128 && *n <= i64::MAX as i128 =>
+            {
+                wip.set(*n as i64)?;
+            }
+            (ScalarType::I128, kdl::KdlValue::Integer(n)) => {
+                wip.set(*n)?;
+            }
+            (ScalarType::ISize, kdl::KdlValue::Integer(n))
+                if *n >= isize::MIN as i128 && *n <= isize::MAX as i128 =>
+            {
+                wip.set(*n as isize)?;
+            }
+
+            // Unsigned integer types
+            (ScalarType::U8, kdl::KdlValue::Integer(n)) if *n >= 0 && *n <= u8::MAX as i128 => {
+                wip.set(*n as u8)?;
+            }
+            (ScalarType::U16, kdl::KdlValue::Integer(n)) if *n >= 0 && *n <= u16::MAX as i128 => {
+                wip.set(*n as u16)?;
+            }
+            (ScalarType::U32, kdl::KdlValue::Integer(n)) if *n >= 0 && *n <= u32::MAX as i128 => {
+                wip.set(*n as u32)?;
+            }
+            (ScalarType::U64, kdl::KdlValue::Integer(n)) if *n >= 0 && *n <= u64::MAX as i128 => {
+                wip.set(*n as u64)?;
+            }
+            (ScalarType::U128, kdl::KdlValue::Integer(n)) if *n >= 0 => {
+                wip.set(*n as u128)?;
+            }
+            (ScalarType::USize, kdl::KdlValue::Integer(n))
+                if *n >= 0 && *n <= usize::MAX as i128 =>
+            {
+                wip.set(*n as usize)?;
+            }
+
+            // Float types
+            (ScalarType::F32, kdl::KdlValue::Float(f)) => {
+                wip.set(*f as f32)?;
+            }
+            (ScalarType::F64, kdl::KdlValue::Float(f)) => {
                 wip.set(*f)?;
             }
-            kdl::KdlValue::Null => {
-                // Handle null values - this would typically be for Option types
+
+            // Also allow integers to be converted to floats
+            (ScalarType::F32, kdl::KdlValue::Integer(n)) => {
+                wip.set(*n as f32)?;
+            }
+            (ScalarType::F64, kdl::KdlValue::Integer(n)) => {
+                wip.set(*n as f64)?;
+            }
+
+            // Char type
+            (ScalarType::Char, kdl::KdlValue::String(s)) if s.len() == 1 => {
+                wip.set(s.chars().next().unwrap())?;
+            }
+
+            // Handle null for any type (will use default)
+            (_, kdl::KdlValue::Null) => {
                 wip.set_default()?;
+            }
+
+            // For types that might implement FromStr
+            (_, kdl::KdlValue::String(s)) => {
+                // Try to parse from string as a fallback
+                wip.parse_from_str(s)?;
+            }
+
+            _ => {
+                return Err(KdlError::from(KdlErrorKind::Reflect(
+                    facet_reflect::ReflectError::OperationFailed {
+                        operation: "Type mismatch in scalar deserialization",
+                        shape: wip.shape(),
+                    },
+                )));
             }
         }
 
@@ -163,11 +312,21 @@ impl<'input, 'facet> KdlDeserializer<'input> {
         // Begin the field by name
         wip.begin_field(name)?;
 
-        // Deserialize the value
+        // Check if we're dealing with a String type that needs parse_from_str
+        // String types are Scalar with is_from_str() true
+        if wip.shape().type_identifier == "String" && wip.shape().is_from_str() {
+            if let kdl::KdlValue::String(s) = value {
+                wip.parse_from_str(s)?;
+                // parse_from_str completes the field, so we don't need to call end()
+                return Ok(());
+            }
+        }
+
+        // For other types (including numbers), use the normal flow
+        // Note: deserialize_value with scalar types will call wip.set() which automatically completes the frame
         self.deserialize_value(wip, value)?;
 
-        // End the field
-        wip.end()?;
+        // Don't call end() here - wip.set() in scalar types already completes the frame
 
         Ok(())
     }
@@ -248,23 +407,10 @@ impl<'input, 'facet> KdlDeserializer<'input> {
         // First check the type system (Type)
         if let Type::User(UserType::Struct(struct_def)) = &wip.shape().ty {
             log::trace!("Document `Partial` is a struct: {struct_def:#?}");
-            // QUESTION: Would be be possible, once we allow custom types, to make all attributes arbitrary? With
-            // the sort of general tool that `facet` is, I think it might actually be best if we didn't try to
-            // "bake-in" anything like sensitive, default, skip, etc...
-            let is_valid_toplevel = struct_def
-                .fields
-                .iter()
-                .all(|field| field.flags.contains(FieldFlags::CHILD));
-            log::trace!("WIP represents a valid top-level: {is_valid_toplevel}");
-
-            if is_valid_toplevel {
-                // FIXME: At this point I'm really not sure where function boundaries should be... It's a messy disaster
-                // whilst I try to work that out...
-                // FIXME: For example, this feels like maybe it should take a `KdlNode` and not a `KdlDocument`?
-                return self.deserialize_node(wip, document);
-            } else {
-                return Err(KdlErrorKind::InvalidDocumentShape(&wip.shape().def).into());
-            }
+            // A struct can be at the top level
+            // We'll handle it as a valid document structure
+            log::trace!("Processing struct at document level");
+            return self.deserialize_node(wip, document);
         }
 
         // Fall back to the def system for backward compatibility
@@ -276,38 +422,53 @@ impl<'input, 'facet> KdlDeserializer<'input> {
         }
     }
 
-    fn deserialize_node(
-        &mut self,
-        wip: &mut Partial<'facet>,
-        mut document: KdlDocument,
-    ) -> Result<()> {
+    fn deserialize_node(&mut self, wip: &mut Partial<'facet>, document: KdlDocument) -> Result<()> {
         log::trace!("Entering `deserialize_node` method");
 
         // Process all nodes in the document
         for node in document.nodes() {
             log::trace!("Processing node: {:#?}", node.name());
 
-            // Try to match the node name with a field
-            wip.begin_field(node.name().value())?;
-            log::trace!(
-                "Node matched expected child; New def: {:#?}",
-                wip.shape().def
-            );
+            // Check if this is a property (no children) or a child node
+            if node.children().is_none() && !node.entries().is_empty() {
+                // This looks like properties at the root level
+                for entry in node.entries() {
+                    if let Some(name) = entry.name() {
+                        // Named property
+                        self.deserialize_property(wip, name.value(), entry.value())?;
+                    } else {
+                        // Positional property (using node name as field name)
+                        self.deserialize_property(wip, node.name().value(), entry.value())?;
+                    }
+                }
+            } else {
+                // Original logic for child nodes
+                // Try to match the node name with a field
+                wip.begin_field(node.name().value())?;
+                log::trace!(
+                    "Node matched expected child; New def: {:#?}",
+                    wip.shape().def
+                );
 
-            // Process entries (arguments and properties)
-            let mut arg_index = 0;
-            for entry in node.entries() {
-                log::trace!("Processing entry: {entry:#?}");
+                // Process entries (arguments and properties)
+                let mut arg_index = 0;
+                for entry in node.entries() {
+                    log::trace!("Processing entry: {entry:#?}");
 
-                if entry.name().is_none() {
-                    // This is an argument - need to begin the field by index
-                    wip.begin_nth_field(arg_index)?;
-                    self.deserialize_value(wip, entry.value())?;
-                    wip.end()?;
-                    arg_index += 1;
-                } else {
-                    // This is a property
-                    self.deserialize_property(wip, entry.name().unwrap().value(), entry.value())?;
+                    if entry.name().is_none() {
+                        // This is an argument - need to begin the field by index
+                        wip.begin_nth_field(arg_index)?;
+                        self.deserialize_value(wip, entry.value())?;
+                        wip.end()?;
+                        arg_index += 1;
+                    } else {
+                        // This is a property
+                        self.deserialize_property(
+                            wip,
+                            entry.name().unwrap().value(),
+                            entry.value(),
+                        )?;
+                    }
                 }
             }
 

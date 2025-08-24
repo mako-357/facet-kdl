@@ -77,6 +77,7 @@ dependencies = [
  "facet",
  "facet-core",
  "facet-reflect",
+ "facet-serialize",
  "facet-testhelpers",
  "indoc",
  "kdl",
@@ -123,6 +124,17 @@ dependencies = [
  "bitflags",
  "facet-core",
  "owo-colors",
+]
+
+[[package]]
+name = "facet-serialize"
+version = "0.28.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "cca2724e50a1f41f9f0d3a035b9dd8ef4d174f2c3bfd7caaab4baeb6d69feed9"
+dependencies = [
+ "facet-core",
+ "facet-reflect",
+ "log",
 ]
 
 [[package]]
