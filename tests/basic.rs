@@ -8,7 +8,6 @@ fn it_works() {
 }
 
 #[test]
-#[ignore]
 fn basic_node() {
     // QUESTION: I don't know when this would be particularly good practice, but it could be nice if `facet` shipped
     // some sort of macro that allowed libraries to rename the Facet trait / attributes.unwrap() This might make it clearer

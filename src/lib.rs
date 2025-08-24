@@ -9,7 +9,7 @@ use std::{
 };
 
 use facet_core::{Def, Facet, FieldFlags, Type, UserType};
-use facet_reflect::{Partial, ReflectError};
+use facet_reflect::{Partial, ReflectError, ScalarType};
 use kdl::{KdlDocument, KdlError as KdlParseError};
 
 // QUESTION: Any interest in making something a bit like `strum` with `facet`? Always nice to have an easy way to get
@@ -91,6 +91,122 @@ struct KdlDeserializer<'input> {
 type Result<T> = std::result::Result<T, KdlError>;
 
 impl<'input, 'facet> KdlDeserializer<'input> {
+    fn deserialize_value(
+        &mut self,
+        wip: &mut Partial<'facet>,
+        value: &kdl::KdlValue,
+    ) -> Result<()> {
+        log::trace!("Deserializing value: {:?}", value);
+
+        // Handle scalar types
+        if let facet_core::Def::Scalar = wip.shape().def {
+            // For scalar types, we need to handle them directly
+            // The actual scalar type information is in the shape
+            self.deserialize_scalar_value(wip, value)?;
+        } else {
+            // For non-scalar types, we might need to handle them differently
+            log::warn!("Non-scalar type encountered: {:?}", wip.shape().def);
+            return Err(KdlError::from(KdlErrorKind::InvalidDocumentShape(
+                &wip.shape().def,
+            )));
+        }
+
+        Ok(())
+    }
+
+    fn deserialize_scalar_value(
+        &mut self,
+        wip: &mut Partial<'facet>,
+        value: &kdl::KdlValue,
+    ) -> Result<()> {
+        log::trace!("Deserializing scalar value: {:?}", value);
+
+        // For scalars, we need to check the actual type and deserialize accordingly
+        // This is a simplified version - in reality we'd need to inspect wip.shape() to get the exact scalar type
+        match value {
+            kdl::KdlValue::String(s) => {
+                // Set string value
+                wip.set_from_function(|_| s.clone())?;
+            }
+            kdl::KdlValue::Bool(b) => {
+                // Set boolean value
+                wip.set_from_function(|_| *b)?;
+            }
+            kdl::KdlValue::Integer(n) => {
+                // For integers, we try to set based on the size
+                // This is simplified - we'd need to check the actual type
+                wip.set_from_function(|_| *n as i64)?;
+            }
+            kdl::KdlValue::Float(f) => {
+                // Set float value
+                wip.set_from_function(|_| *f)?;
+            }
+            kdl::KdlValue::Null => {
+                // Handle null values - this would typically be for Option types
+                wip.set_default()?;
+            }
+        }
+
+        Ok(())
+    }
+
+    fn deserialize_property(
+        &mut self,
+        wip: &mut Partial<'facet>,
+        name: &str,
+        value: &kdl::KdlValue,
+    ) -> Result<()> {
+        log::trace!("Deserializing property '{}': {:?}", name, value);
+
+        // Begin the field by name
+        wip.begin_field(name)?;
+
+        // Deserialize the value
+        self.deserialize_value(wip, value)?;
+
+        // End the field
+        wip.end()?;
+
+        Ok(())
+    }
+
+    fn deserialize_children(
+        &mut self,
+        wip: &mut Partial<'facet>,
+        children: &kdl::KdlDocument,
+    ) -> Result<()> {
+        log::trace!("Deserializing children nodes");
+
+        for child_node in children.nodes() {
+            log::trace!("Processing child node: {:#?}", child_node.name());
+
+            // Process each child node recursively
+            wip.begin_field(child_node.name().value())?;
+
+            // Process the child node's entries
+            let mut arg_index = 0;
+            for entry in child_node.entries() {
+                if entry.name().is_none() {
+                    wip.begin_nth_field(arg_index)?;
+                    self.deserialize_value(wip, entry.value())?;
+                    wip.end()?;
+                    arg_index += 1;
+                } else {
+                    self.deserialize_property(wip, entry.name().unwrap().value(), entry.value())?;
+                }
+            }
+
+            // Process nested children if any
+            if let Some(nested_children) = child_node.children() {
+                self.deserialize_children(wip, nested_children)?;
+            }
+
+            wip.end()?;
+        }
+
+        Ok(())
+    }
+
     fn from_str<T: Facet<'facet>>(kdl: &'input str) -> Result<T> {
         log::trace!("Entering `from_str` method");
 
@@ -165,29 +281,44 @@ impl<'input, 'facet> KdlDeserializer<'input> {
     ) -> Result<()> {
         log::trace!("Entering `deserialize_node` method");
 
-        // TODO: Correctly generate that error and write a constructor that gets rid of the `.to_owned()`?
-        let node = document
-            .nodes_mut()
-            .pop()
-            .ok_or_else(|| KdlErrorKind::MissingNodes(vec!["TODO".to_owned()]))?;
-        log::trace!("Popped node from `KdlDocument`: {node:#?}");
+        // Process all nodes in the document
+        for node in document.nodes() {
+            log::trace!("Processing node: {:#?}", node.name());
 
-        wip.begin_field(node.name().value())?;
-        log::trace!(
-            "Node matched expected child; New def: {:#?}",
-            wip.shape().def
-        );
+            // Try to match the node name with a field
+            wip.begin_field(node.name().value())?;
+            log::trace!(
+                "Node matched expected child; New def: {:#?}",
+                wip.shape().def
+            );
 
-        // TODO: Planning to step through those entries one at a time then dispatch a method like
-        // `deserialize_argument()` or `deserialize_property()` depending on which it is. Then I need a way to keep
-        // track of which `Partial` fields have already been filled? I think that shouldn't be too bad, then I can just
-        // grab the next "unfilled" argument field if it's an argument, or search all of the (filled or unfilled) fields
-        // if it's a parameter?
-        for entry in node.entries() {
-            log::trace!("Processing entry: {entry:#?}");
+            // Process entries (arguments and properties)
+            let mut arg_index = 0;
+            for entry in node.entries() {
+                log::trace!("Processing entry: {entry:#?}");
+
+                if entry.name().is_none() {
+                    // This is an argument - need to begin the field by index
+                    wip.begin_nth_field(arg_index)?;
+                    self.deserialize_value(wip, entry.value())?;
+                    wip.end()?;
+                    arg_index += 1;
+                } else {
+                    // This is a property
+                    self.deserialize_property(wip, entry.name().unwrap().value(), entry.value())?;
+                }
+            }
+
+            // Process child nodes if any
+            if let Some(children) = node.children() {
+                self.deserialize_children(wip, children)?;
+            }
+
+            // Finish processing this field
+            wip.end()?;
         }
 
-        todo!()
+        Ok(())
     }
 }
 
