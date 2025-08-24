@@ -9,7 +9,7 @@ use std::{
 };
 
 use facet_core::{Def, Facet, FieldFlags, Type, UserType};
-use facet_reflect::{Partial, ReflectError, ScalarType};
+use facet_reflect::{Partial, ReflectError};
 use kdl::{KdlDocument, KdlError as KdlParseError};
 
 // QUESTION: Any interest in making something a bit like `strum` with `facet`? Always nice to have an easy way to get
@@ -126,20 +126,22 @@ impl<'input, 'facet> KdlDeserializer<'input> {
         match value {
             kdl::KdlValue::String(s) => {
                 // Set string value
-                wip.set_from_function(|_| s.clone())?;
+                let value = s.clone();
+                wip.set(value)?;
             }
             kdl::KdlValue::Bool(b) => {
                 // Set boolean value
-                wip.set_from_function(|_| *b)?;
+                wip.set(*b)?;
             }
             kdl::KdlValue::Integer(n) => {
                 // For integers, we try to set based on the size
                 // This is simplified - we'd need to check the actual type
-                wip.set_from_function(|_| *n as i64)?;
+                let value = *n as i64;
+                wip.set(value)?;
             }
             kdl::KdlValue::Float(f) => {
                 // Set float value
-                wip.set_from_function(|_| *f)?;
+                wip.set(*f)?;
             }
             kdl::KdlValue::Null => {
                 // Handle null values - this would typically be for Option types
