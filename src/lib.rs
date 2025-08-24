@@ -308,14 +308,21 @@ impl<'input, 'facet> KdlDeserializer<'input> {
         value: &kdl::KdlValue,
     ) -> Result<()> {
         log::trace!("Deserializing property '{}': {:?}", name, value);
+        eprintln!("DEBUG: deserialize_property '{}': {:?}", name, value);
+        eprintln!("  Current shape: {}", wip.shape().type_identifier);
 
         // Begin the field by name
         wip.begin_field(name)?;
+        eprintln!(
+            "  After begin_field, shape: {}",
+            wip.shape().type_identifier
+        );
 
         // Check if we're dealing with a String type that needs parse_from_str
         // String types are Scalar with is_from_str() true
         if wip.shape().type_identifier == "String" && wip.shape().is_from_str() {
             if let kdl::KdlValue::String(s) = value {
+                eprintln!("  Using parse_from_str for String");
                 wip.parse_from_str(s)?;
                 // parse_from_str completes the field, so we don't need to call end()
                 return Ok(());
@@ -337,32 +344,36 @@ impl<'input, 'facet> KdlDeserializer<'input> {
         children: &kdl::KdlDocument,
     ) -> Result<()> {
         log::trace!("Deserializing children nodes");
+        eprintln!("DEBUG: deserialize_children");
+        eprintln!(
+            "  Current shape in children: {}",
+            wip.shape().type_identifier
+        );
 
+        // When we're here, we're already inside a field (e.g., "meta")
+        // So we just need to process the properties within
         for child_node in children.nodes() {
             log::trace!("Processing child node: {:#?}", child_node.name());
+            eprintln!("  Processing child node: {}", child_node.name().value());
 
-            // Process each child node recursively
-            wip.begin_field(child_node.name().value())?;
-
-            // Process the child node's entries
-            let mut arg_index = 0;
+            // Each node in children represents a property
             for entry in child_node.entries() {
-                if entry.name().is_none() {
-                    wip.begin_nth_field(arg_index)?;
-                    self.deserialize_value(wip, entry.value())?;
-                    wip.end()?;
-                    arg_index += 1;
+                if let Some(name) = entry.name() {
+                    // Named property
+                    eprintln!("    Named entry: {}", name.value());
+                    self.deserialize_property(wip, name.value(), entry.value())?;
                 } else {
-                    self.deserialize_property(wip, entry.name().unwrap().value(), entry.value())?;
+                    // Positional property (using node name as field name)
+                    eprintln!("    Positional entry for: {}", child_node.name().value());
+                    self.deserialize_property(wip, child_node.name().value(), entry.value())?;
                 }
             }
 
             // Process nested children if any
             if let Some(nested_children) = child_node.children() {
+                eprintln!("  Node has nested children");
                 self.deserialize_children(wip, nested_children)?;
             }
-
-            wip.end()?;
         }
 
         Ok(())
@@ -470,15 +481,17 @@ impl<'input, 'facet> KdlDeserializer<'input> {
                         )?;
                     }
                 }
-            }
 
-            // Process child nodes if any
-            if let Some(children) = node.children() {
-                self.deserialize_children(wip, children)?;
-            }
+                // Process child nodes if any
+                if let Some(children) = node.children() {
+                    log::trace!("Node has children, processing them");
+                    self.deserialize_children(wip, children)?;
+                }
 
-            // Finish processing this field
-            wip.end()?;
+                // End the field after processing all entries and children
+                log::trace!("Ending field for node: {}", node.name().value());
+                wip.end()?;
+            }
         }
 
         Ok(())
